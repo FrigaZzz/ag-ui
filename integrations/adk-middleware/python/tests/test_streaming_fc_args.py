@@ -67,6 +67,20 @@ async def _collect_events(translator, adk_event, thread_id="thread", run_id="run
     return events
 
 
+async def _final(translator, name, args, fc_id="adk-final"):
+    """Send the aggregated (non-partial) call that follows the streamed chunks."""
+    fc = _make_func_call(name=name, args=args, fc_id=fc_id)
+    return await _collect_events(translator, _make_adk_event(func_calls=[fc], partial=False))
+
+
+def _args_json(events, tool_call_id=None):
+    return "".join(
+        e.delta for e in events
+        if "TOOL_CALL_ARGS" in str(e.type)
+        and (tool_call_id is None or e.tool_call_id == tool_call_id)
+    )
+
+
 # ============================================================================
 # First chunk tests
 # ============================================================================
@@ -171,8 +185,8 @@ async def test_streaming_fc_multiple_continuations():
 
 
 @pytest.mark.asyncio
-async def test_streaming_fc_end_emits_end():
-    """End marker emits closing JSON + TOOL_CALL_END."""
+async def test_streaming_fc_end_comes_with_final():
+    """The end marker emits nothing; the aggregated call closes JSON + TOOL_CALL_END."""
     translator = EventTranslator(streaming_function_call_arguments=True)
 
     # First chunk
@@ -189,15 +203,12 @@ async def test_streaming_fc_end_emits_end():
     # End marker
     fc_end = _make_func_call(fc_id="adk-3")  # no name, no partial_args, no will_continue
     event_end = _make_adk_event(func_calls=[fc_end], partial=True)
-    events = await _collect_events(translator, event_end)
-    types = _event_types(events)
+    assert await _collect_events(translator, event_end) == []
 
-    assert "TOOL_CALL_ARGS" in types  # Closing JSON '"}'
-    assert "TOOL_CALL_END" in types
-
-    # Closing JSON delta should be '"}'
-    closing = [e for e in events if "TOOL_CALL_ARGS" in str(e.type)][0]
-    assert closing.delta == '"}'
+    events = await _final(translator, "write_document", {"document": "content"})
+    assert _event_types(events) == ["TOOL_CALL_ARGS", "TOOL_CALL_END"]
+    assert events[0].delta == '"}'
+    assert events[1].tool_call_id == "adk-1"
 
 
 # ============================================================================
@@ -226,6 +237,7 @@ async def test_streaming_fc_full_sequence():
     # End marker
     fc_end = _make_func_call(fc_id="adk-4")
     all_events += await _collect_events(translator, _make_adk_event(func_calls=[fc_end], partial=True))
+    all_events += await _final(translator, "write_document", {"document": "Hello World"})
 
     types = _event_types(all_events)
     assert types[0] == "TOOL_CALL_START"
@@ -254,6 +266,7 @@ async def test_streaming_fc_json_deltas_concatenate():
     # End marker
     fc_end = _make_func_call(fc_id="adk-4")
     all_events += await _collect_events(translator, _make_adk_event(func_calls=[fc_end], partial=True))
+    all_events += await _final(translator, "write_document", {"document": "Hello World"})
 
     # Concatenate all TOOL_CALL_ARGS deltas
     args_deltas = [e.delta for e in all_events if "TOOL_CALL_ARGS" in str(e.type)]
@@ -289,9 +302,11 @@ async def test_streaming_fc_suppresses_final_aggregated():
     events = await _collect_events(translator, final_event)
 
     types = _event_types(events)
-    # Should NOT emit duplicate TOOL_CALL events
+    # No second call: the final only completes the streamed one
     assert "TOOL_CALL_START" not in types
-    assert "TOOL_CALL_END" not in types
+    assert types.count("TOOL_CALL_END") == 1
+    assert {e.tool_call_id for e in events} == {"adk-1"}
+    assert json.loads(_args_json(events)) == {"document": "full content"}
 
 
 @pytest.mark.asyncio
@@ -400,18 +415,14 @@ async def test_streaming_fc_resets_on_reset():
     # Start streaming
     fc1 = _make_func_call(name="write_document", will_continue=True, fc_id="adk-1")
     await _collect_events(translator, _make_adk_event(func_calls=[fc1], partial=True))
-    assert translator._active_streaming_fc_id is not None
+    assert translator._fc_arg_streams
 
     # Reset
     translator.reset()
 
     # State should be clean
-    assert translator._active_streaming_fc_id is None
-    assert translator._active_streaming_fc_name is None
-    assert len(translator._streaming_fc_open_paths) == 0
-    assert len(translator._streaming_fc_started_paths) == 0
-    assert len(translator._completed_streaming_fc_names) == 0
-    assert translator._last_completed_streaming_fc_name is None
+    assert not translator._fc_arg_streams
+    assert not translator._confirmed_to_streaming_id
 
 
 # ============================================================================
@@ -463,6 +474,9 @@ async def test_streaming_fc_special_chars_escaped():
     # End
     fc_end = _make_func_call(fc_id="adk-3")
     end_events = await _collect_events(translator, _make_adk_event(func_calls=[fc_end], partial=True))
+    end_events += await _final(
+        translator, "write_document", {"document": 'He said "hello"\nNew line'}
+    )
 
     # Concatenate all args deltas and verify valid JSON
     all_events = events + end_events
@@ -512,3 +526,81 @@ async def test_streaming_fc_deferred_end_for_stream_tool_call():
 
     # TOOL_CALL_END should NOT be emitted (deferred)
     assert "TOOL_CALL_END" not in types
+
+
+# ============================================================================
+# LiteLLM shape: every chunk named, same provider id, no end marker
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_litellm_shape_streams_one_valid_call():
+    """LiteLLM streams nested args on every chunk with will_continue=True and only
+    then sends the aggregated call with the same id: one call, valid JSON args."""
+    translator = EventTranslator(streaming_function_call_arguments=True)
+    chunks = [
+        [_make_partial_arg("$.nodeId", "concept_")],  # first chunk already has args
+        [_make_partial_arg("$.nodeId", "51ea")],
+        [_make_partial_arg("$.fields.value", 'Idea: "sentinel"')],
+        [_make_partial_arg("$.fields.value", " species")],
+    ]
+    events = []
+    for pas in chunks:
+        fc = _make_func_call(
+            name="revise_fields", partial_args=pas, will_continue=True, fc_id="call_0"
+        )
+        events += await _collect_events(translator, _make_adk_event(func_calls=[fc], partial=True))
+    final_args = {"nodeId": "concept_51ea", "fields": {"value": 'Idea: "sentinel" species'}}
+    events += await _final(translator, "revise_fields", final_args, fc_id="call_0")
+
+    types = _event_types(events)
+    assert types[0] == "TOOL_CALL_START" and types[-1] == "TOOL_CALL_END"
+    assert types.count("TOOL_CALL_START") == 1 and types.count("TOOL_CALL_END") == 1
+    assert {e.tool_call_id for e in events} == {"call_0"}
+    assert types.count("TOOL_CALL_ARGS") >= len(chunks)  # streamed, not one blob
+    assert json.loads(_args_json(events)) == final_args
+
+
+@pytest.mark.asyncio
+async def test_parallel_streamed_calls_stay_separate():
+    """Two calls streamed under different ids never merge into one."""
+    translator = EventTranslator(streaming_function_call_arguments=True)
+    events = []
+    for fc_id, text in [("call_0", "a"), ("call_1", "b"), ("call_0", "c"), ("call_1", "d")]:
+        fc = _make_func_call(
+            name="revise_fields",
+            partial_args=[_make_partial_arg("$.value", text)],
+            will_continue=True,
+            fc_id=fc_id,
+        )
+        events += await _collect_events(translator, _make_adk_event(func_calls=[fc], partial=True))
+    final = _make_adk_event(
+        func_calls=[
+            _make_func_call(name="revise_fields", args={"value": "ac"}, fc_id="call_0"),
+            _make_func_call(name="revise_fields", args={"value": "bd"}, fc_id="call_1"),
+        ],
+        partial=False,
+    )
+    events += await _collect_events(translator, final)
+
+    assert _event_types(events).count("TOOL_CALL_START") == 2
+    assert json.loads(_args_json(events, "call_0")) == {"value": "ac"}
+    assert json.loads(_args_json(events, "call_1")) == {"value": "bd"}
+
+
+@pytest.mark.asyncio
+async def test_unfinished_stream_closed_at_run_end():
+    """A stream whose final never arrives is closed into valid JSON."""
+    translator = EventTranslator(streaming_function_call_arguments=True)
+    fc = _make_func_call(
+        name="revise_fields",
+        partial_args=[_make_partial_arg("$.value", "cut sh")],
+        will_continue=True,
+        fc_id="call_0",
+    )
+    events = await _collect_events(translator, _make_adk_event(func_calls=[fc], partial=True))
+    events += [e async for e in translator.close_open_lro_arg_streams()]
+
+    assert _event_types(events)[-1] == "TOOL_CALL_END"
+    assert json.loads(_args_json(events)) == {"value": "cut sh"}
+    assert not translator.has_open_lro_arg_stream()  # backend streams don't gate LRO drain

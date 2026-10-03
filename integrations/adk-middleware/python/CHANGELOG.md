@@ -58,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Requires `ag-ui-protocol>=0.1.19`.
+- `PredictStateMapping.stream_tool_call` is deprecated and has no effect: a
+  streamed tool call now always stays open until its aggregated final call.
 
 ### Removed
 
@@ -65,6 +67,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With `streaming_function_call_arguments=True`, backend (non long-running)
+  tool calls now stream like any AG-UI tool call, for every ADK model adapter
+  (Gemini, LiteLLM, ...): one `TOOL_CALL_START` under the model's call id,
+  `TOOL_CALL_ARGS` deltas that concatenate to the exact final JSON arguments
+  (nested paths included), and one `TOOL_CALL_END` with the aggregated call.
+  Before, the call got a generated id, nested paths were written as flat keys
+  in invalid JSON (`{"a": "x{"b.c": "y`), and on adapters without an end marker
+  (LiteLLM) the call was never closed and was then emitted a second time from
+  the aggregated call. Parallel streamed calls no longer merge into one, and the
+  first chunk's arguments are no longer dropped.
 - An answer to a paused run is no longer lost when its continuation is refused
   before it starts (for example "Maximum concurrent executions reached"). The
   pending tool call or `confirm_changes` id and the answering message are now

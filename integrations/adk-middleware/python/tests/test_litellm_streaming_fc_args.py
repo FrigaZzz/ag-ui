@@ -370,3 +370,72 @@ async def test_agui_streams_parallel_tool_calls_independently(resumable: bool):
             )
             == 1
         )
+
+
+# --------------------------------------------------------------------------- #
+# Layer 2b — backend (non-LRO) tools: the same conformant tool-call stream
+# --------------------------------------------------------------------------- #
+def backend_write_document(
+    title: str,
+    content: str,
+    priority: int = 0,
+    published: bool = False,
+    tags: list[str] | None = None,
+    meta: dict | None = None,
+) -> dict:
+    """Write a document on the server.
+
+    Args:
+        title: Title.
+        content: Body.
+        priority: Priority.
+        published: Published flag.
+        tags: Tags.
+        meta: Metadata.
+    """
+    return {"ok": True}
+
+
+backend_write_document.__name__ = TOOL_NAME
+
+
+@pytest.mark.parametrize("parallel_calls", [1, 2], ids=["single", "parallel"])
+async def test_agui_streams_backend_tool_call_once(parallel_calls: int):
+    """A backend tool streams like any AG-UI tool call: one START under the
+    provider id, deltas joining to the final JSON, one END, then its RESULT."""
+    agent = ADKAgent(
+        adk_agent=_agent([backend_write_document], parallel_calls),
+        app_name="litellm_backend_stream_test",
+        user_id="u",
+        use_in_memory_services=True,
+        streaming_function_call_arguments=True,
+    )
+    inp = RunAgentInput(
+        thread_id=f"t-{uuid.uuid4().hex[:8]}",
+        run_id=f"r-{uuid.uuid4().hex[:8]}",
+        messages=[UserMessage(id="u1", role="user", content="write it")],
+        tools=[],
+        context=[],
+        state={},
+        forwarded_props={},
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        events = [ev async for ev in agent.run(inp)]
+
+    assert not [e for e in events if e.type == EventType.RUN_ERROR]
+    idx = {id(e): i for i, e in enumerate(events)}
+    starts = [e for e in events if e.type == EventType.TOOL_CALL_START]
+    assert [s.tool_call_id for s in starts] == [f"call_{i}" for i in range(parallel_calls)]
+    for index, start in enumerate(starts):
+        cid = start.tool_call_id
+        of = lambda t: [e for e in events if e.type == t and e.tool_call_id == cid]  # noqa: E731
+        args, ends, results = (
+            of(EventType.TOOL_CALL_ARGS),
+            of(EventType.TOOL_CALL_END),
+            of(EventType.TOOL_CALL_RESULT),
+        )
+        assert len(args) > 3, "backend tool args were not streamed incrementally"
+        assert json.loads("".join(e.delta for e in args)) == _arguments(index)
+        assert len(ends) == 1 and len(results) == 1
+        assert idx[id(start)] < idx[id(args[-1])] < idx[id(ends[0])] < idx[id(results[0])]

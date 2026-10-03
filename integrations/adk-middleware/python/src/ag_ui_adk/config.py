@@ -21,8 +21,8 @@ class PredictStateMapping:
         tool_argument: The argument name from the tool that provides the value
         emit_confirm_tool: If True (default), emit a confirm_changes tool call
             after this tool completes. This triggers the confirmation dialog in the UI.
-        stream_tool_call: If True, defer TOOL_CALL_END during streaming FC args
-            to keep the tool call "open" for LRO/HITL flows.
+        stream_tool_call: Deprecated, no effect. A streamed tool call now always
+            stays open until its aggregated final call, which sends TOOL_CALL_END.
     """
 
     state_key: str
