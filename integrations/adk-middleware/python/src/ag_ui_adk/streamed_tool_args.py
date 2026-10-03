@@ -36,6 +36,9 @@ _JSON_PATH_TOKEN_RE = re.compile(
 )
 _ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f"}
 _TRAILING_SCALAR_RE = re.compile(r"[-+0-9.eEtruefalsn]+$")
+# A surrogate code unit in a Python str is always unpaired (a pair decodes to
+# one code point), cannot be UTF-8 encoded and must never reach the wire.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
 
 PathToken = Union[str, int]
 
@@ -76,6 +79,24 @@ def _dumps(value: Any) -> str:
     return json.dumps(_normalize(value), ensure_ascii=False, separators=(",", ":"))
 
 
+def _join(current: str, fragment: str) -> str:
+    """Append a streamed string fragment.
+
+    When a ``\\uXXXX`` surrogate pair is split across provider chunks, ADK's
+    path tracker sends the lone high surrogate, then the whole string so far
+    with the pair decoded. A fragment that starts with the low surrogate
+    completes the pair instead.
+    """
+    if current and "\ud800" <= current[-1] <= "\udbff":
+        head = current[:-1]
+        if len(fragment) > len(head) and fragment.startswith(head):
+            return fragment
+        if fragment and "\udc00" <= fragment[0] <= "\udfff":
+            pair = (current[-1] + fragment[0]).encode("utf-16", "surrogatepass")
+            return head + pair.decode("utf-16") + fragment[1:]
+    return current + fragment
+
+
 def _stable_prefix(serialized: str) -> str:
     """Drop the tail of a partial serialization that may still change.
 
@@ -87,9 +108,12 @@ def _stable_prefix(serialized: str) -> str:
     while end and serialized[end - 1] in "}]":
         end -= 1
     if end and serialized[end - 1] == '"':
-        return serialized[: end - 1]
-    m = _TRAILING_SCALAR_RE.search(serialized, 0, end)
-    return serialized[: m.start()] if m else serialized[:end]
+        prefix = serialized[: end - 1]
+    else:
+        m = _TRAILING_SCALAR_RE.search(serialized, 0, end)
+        prefix = serialized[: m.start()] if m else serialized[:end]
+    lone = _SURROGATE_RE.search(prefix)  # wait for the rest of the pair
+    return prefix[: lone.start()] if lone else prefix
 
 
 class StreamedToolArgs:
@@ -130,7 +154,10 @@ class StreamedToolArgs:
         ``final_args`` is the aggregated ``FunctionCall.args``; when it's not
         available (stream cut short) the partially rebuilt object is closed.
         """
-        target = _dumps(final_args if isinstance(final_args, dict) else self._value)
+        if isinstance(final_args, dict):
+            target = _dumps(final_args)
+        else:  # stream cut short: drop a half surrogate pair rather than send it
+            target = _SURROGATE_RE.sub("", _dumps(self._value))
         if not target.startswith(self._emitted):
             # Should not happen: chunks disagreed with the final call. The
             # client-side JSON would be corrupt either way; log loudly.
@@ -204,7 +231,7 @@ class StreamedToolArgs:
         if is_string:
             if not isinstance(current, str):
                 return False
-            container[leaf] = current + value
+            container[leaf] = _join(current, value)
         else:
             container[leaf] = value
         return True

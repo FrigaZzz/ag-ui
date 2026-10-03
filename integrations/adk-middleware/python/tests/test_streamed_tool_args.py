@@ -112,3 +112,31 @@ def test_no_partial_args_emits_nothing_until_final():
     assert s.apply(None) == ""
     assert s.apply([]) == ""
     assert s.finish({"x": 1}) == '{"x":1}'
+
+
+def test_surrogate_pair_split_across_chunks():
+    """ADK's path tracker splits an escaped emoji pair: it sends the lone high
+    surrogate, then the whole string so far with the pair decoded. No delta may
+    carry a lone surrogate, and the deltas still join to the final JSON."""
+    final = {"title": 'Say "hi" \U0001f600\U0001f44d!', "tag": "\U0001f9ea lab"}
+    deltas = _run(
+        [
+            [_pa("$.title", string_value='Say "hi" ')],
+            [_pa("$.title", string_value="\ud83d")],
+            [_pa("$.title", string_value='Say "hi" \U0001f600')],  # resend
+            [_pa("$.title", string_value="\ud83d")],
+            [_pa("$.title", string_value="\udc4d!")],  # low half completes the pair
+            [_pa("$.tag", string_value="\ud83e")],
+            [_pa("$.tag", string_value="\U0001f9ea lab")],  # resend from empty
+        ],
+        final,
+    )
+    for d in deltas:
+        d.encode("utf-8")  # raises on a lone surrogate
+    assert json.loads("".join(deltas)) == final
+
+
+def test_cut_short_inside_surrogate_pair_drops_the_half():
+    s = StreamedToolArgs("id-1", "tool")
+    sent = s.apply([_pa("$.t", string_value="ok \ud83d")]) + s.finish(None)
+    assert json.loads(sent) == {"t": "ok "}
