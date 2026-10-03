@@ -1065,9 +1065,10 @@ class EventTranslator:
 
         Matched by ADK id first. Some adapters (Gemini on Vertex) send nameless
         continuation chunks with fresh ids, and the aggregated final call may
-        carry a different id (#1168), so fall back to the oldest open stream
-        (nameless chunk) or the oldest open stream with the same name (final).
-        ``streams`` defaults to the LRO streams.
+        carry a different id (#1168), so fall back to the newest open stream
+        (nameless chunk: it continues the call that was opened last, while
+        earlier calls stay open until their final) or the oldest open stream
+        with the same name (final). ``streams`` defaults to the LRO streams.
         """
         streams = self._lro_arg_streams if streams is None else streams
         if not streams:
@@ -1077,7 +1078,7 @@ class EventTranslator:
             return streams[fc_id]
         name = getattr(fc, 'name', None)
         if not name and is_partial:
-            return next(iter(streams.values()))
+            return next(reversed(streams.values()))
         if name and not is_partial:
             for stream in streams.values():
                 if stream.tool_name == name:

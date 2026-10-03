@@ -604,3 +604,39 @@ async def test_unfinished_stream_closed_at_run_end():
     assert _event_types(events)[-1] == "TOOL_CALL_END"
     assert json.loads(_args_json(events)) == {"value": "cut sh"}
     assert not translator.has_open_lro_arg_stream()  # backend streams don't gate LRO drain
+
+
+@pytest.mark.asyncio
+async def test_gemini_shape_sequential_calls_stay_separate():
+    """Gemini streams calls one after another, each with nameless continuations
+    under fresh ids and an end marker; a call stays open until the aggregated
+    final, so the next call's continuations must not land on the first one."""
+    translator = EventTranslator(streaming_function_call_arguments=True)
+    events = []
+    for name_id, cont_id, end_id, key, text in [
+        ("g1", "g2", "g3", "x", "A1"),
+        ("g4", "g5", "g6", "y", "B1"),
+    ]:
+        for fc in [
+            _make_func_call(name="tool", will_continue=True, fc_id=name_id),
+            _make_func_call(
+                partial_args=[_make_partial_arg(f"$.{key}", text)],
+                will_continue=True,
+                fc_id=cont_id,
+            ),
+            _make_func_call(fc_id=end_id),
+        ]:
+            events += await _collect_events(translator, _make_adk_event(func_calls=[fc], partial=True))
+    final = _make_adk_event(
+        func_calls=[
+            _make_func_call(name="tool", args={"x": "A1"}, fc_id="f1"),
+            _make_func_call(name="tool", args={"y": "B1"}, fc_id="f2"),
+        ],
+        partial=False,
+    )
+    events += await _collect_events(translator, final)
+
+    assert _event_types(events).count("TOOL_CALL_START") == 2
+    assert _event_types(events).count("TOOL_CALL_END") == 2
+    assert json.loads(_args_json(events, "g1")) == {"x": "A1"}
+    assert json.loads(_args_json(events, "g4")) == {"y": "B1"}
